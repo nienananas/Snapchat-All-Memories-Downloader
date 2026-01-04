@@ -1,3 +1,6 @@
 .vscode
 downloads
 json
+
+venv/
+__pycache__/

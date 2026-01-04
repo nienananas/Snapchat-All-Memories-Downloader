@@ -3,6 +3,7 @@ import asyncio
 import json
 import os
 import re
+import io
 import time
 from datetime import datetime
 from pathlib import Path
@@ -11,11 +12,14 @@ import exif
 import httpx
 from pydantic import BaseModel, Field, field_validator
 from tqdm.asyncio import tqdm
+from PIL import Image
+import zipfile
+
 
 
 class Memory(BaseModel):
     date: datetime = Field(alias="Date")
-    download_link: str = Field(alias="Download Link")
+    download_link: str = Field(alias="Media Download Url")
     location: str = Field(default="", alias="Location")
     latitude: float | None = None
     longitude: float | None = None
@@ -53,12 +57,44 @@ def load_memories(json_path: Path) -> list[Memory]:
 
 async def get_cdn_url(download_link: str) -> str:
     async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.post(
+        response = await client.get(
             download_link,
             headers={"Content-Type": "application/x-www-form-urlencoded"},
         )
         response.raise_for_status()
         return response.text.strip()
+    
+    
+def handle_zip_folders(content):
+    """
+    Since snapchat stores memories with added text etc. as a zip folder containing the base image and the masks, 
+    it is necessary to unzip the folder and then combine the images.
+    
+    :param content: The html response content containing the zip
+    :returns: the combined image as an PIL image
+    """
+    original = None
+    masks = []
+
+    with zipfile.ZipFile(io.BytesIO(content)) as z:
+        for name in z.namelist():
+            if name.lower().endswith(".jpg"):
+                original = z.read(name)
+            elif name.lower().endswith(".png"):
+                masks.append(z.read(name))
+
+
+    base = Image.open(io.BytesIO(original)).convert("RGBA")
+
+    for mask_bytes in masks:
+        mask = Image.open(io.BytesIO(mask_bytes)).convert("RGBA")
+
+        if mask.size != base.size:
+            mask = mask.resize(base.size)
+
+        base = Image.alpha_composite(base, mask)
+
+    return base.convert("RGB")
 
 
 def add_exif_data(image_path: Path, memory: Memory):
@@ -99,15 +135,35 @@ async def download_memory(
 ) -> tuple[bool, int]:
     async with semaphore:
         try:
-            cdn_url = await get_cdn_url(memory.download_link)
-            ext = Path(cdn_url.split("?")[0]).suffix or ".jpg"
-            output_path = output_dir / f"{memory.filename}{ext}"
+            cdn_url = memory.download_link
+            #await get_cdn_url(memory.download_link)            
 
-            async with httpx.AsyncClient(timeout=30.0, follow_redirects=True) as client:
+            async with httpx.AsyncClient(timeout=60.0, follow_redirects=True) as client:
                 response = await client.get(cdn_url)
                 response.raise_for_status()
 
-                output_path.write_bytes(response.content)
+                content = response.content
+
+                # Distinguish the content by content type
+                content_type = response.headers.get("Content-Type", "").lower()
+                if "image/jpg" in content_type:
+                    ext = ".jpg"
+                elif "video/mp4" in content_type:
+                    ext = ".mp4"
+                elif "application/zip" in content_type:
+                    ext = ".jpg"
+
+                else:
+                    raise ValueError(f"Unknown content type: {content_type}")
+
+                output_path = output_dir / f"{memory.filename}{ext}"
+                if "application/zip" in content_type:
+                    # Unzip file + combine base image + masks
+                    combined_image = handle_zip_folders(content)
+                    combined_image.save(output_path)
+                    
+                else:
+                    output_path.write_bytes(content)
 
                 timestamp = memory.date.timestamp()
                 os.utime(output_path, (timestamp, timestamp))
@@ -184,7 +240,7 @@ async def main():
         description="Download Snapchat memories from data export"
     )
     parser.add_argument(
-        "json_file",
+        "-i", "--input",
         nargs="?",
         default="json/memories_history.json",
         help="Path to memories_history.json",
@@ -201,7 +257,7 @@ async def main():
     )
     args = parser.parse_args()
 
-    json_path = Path(args.json_file)
+    json_path = Path(args.input)
     output_dir = Path(args.output)
 
     memories = load_memories(json_path)
