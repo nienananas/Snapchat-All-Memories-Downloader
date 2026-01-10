@@ -14,6 +14,9 @@ from pydantic import BaseModel, Field, field_validator
 from tqdm.asyncio import tqdm
 from PIL import Image
 import zipfile
+import ffmpeg
+import tempfile
+from pathlib import Path
 
 
 
@@ -64,26 +67,8 @@ async def get_cdn_url(download_link: str) -> str:
         response.raise_for_status()
         return response.text.strip()
     
-    
-def handle_zip_folders(content):
-    """
-    Since snapchat stores memories with added text etc. as a zip folder containing the base image and the masks, 
-    it is necessary to unzip the folder and then combine the images.
-    
-    :param content: The html response content containing the zip
-    :returns: the combined image as an PIL image
-    """
-    original = None
-    masks = []
 
-    with zipfile.ZipFile(io.BytesIO(content)) as z:
-        for name in z.namelist():
-            if name.lower().endswith(".jpg"):
-                original = z.read(name)
-            elif name.lower().endswith(".png"):
-                masks.append(z.read(name))
-
-
+def handle_image_with_text(original, masks, output_path: Path):
     base = Image.open(io.BytesIO(original)).convert("RGBA")
 
     for mask_bytes in masks:
@@ -94,8 +79,69 @@ def handle_zip_folders(content):
 
         base = Image.alpha_composite(base, mask)
 
-    return base.convert("RGB")
+    base.convert("RGB").save(output_path)
 
+
+def handle_video_with_text(original, masks, output_path: Path):
+    original_bytes = io.BytesIO(original)
+    with tempfile.TemporaryDirectory as tmp:
+        tmp = Path(tmp)
+        video_in = tmp/ "input.mp4"
+        video_in.write_bytes(original_bytes)        
+
+        stream = ffmpeg.input(str(video_in))
+        
+        for i, mask in enumerate(masks):
+            mask_in = tmp/ f"mask_{i}.png"
+            mask_in.write_bytes(io.BytesIO(mask))
+            stream = ffmpeg.overlay(stream, ffmpeg.input(str(mask_in)))
+        
+        video_out = tmp/ "output.mp4"        
+
+        (
+            stream
+            .output(
+                str(video_out),
+                vcodec="libx264",
+                acodec="copy",
+                pix_fmt="yuv420p",
+                movflags="+faststart",
+            )
+            .overwrite_output()
+            .run(quiet=True)
+        )
+
+        output_path.write_bytes(video_out.read_bytes())
+
+
+def handle_zip_folders(content, output_path: Path):
+    """
+    Since snapchat stores memories with added text etc. as a zip folder containing the base image/video and the masks, 
+    it is necessary to unzip the folder and then combines the images or the video and the images.
+    
+    :param content: The html response content containing the zip
+    :param output_path: The path were the combined content should be saved
+    """
+    original = None
+    masks = []
+    video = False
+
+    with zipfile.ZipFile(io.BytesIO(content)) as z:
+        for name in z.namelist():
+            if name.lower().endswith(".jpg"):
+                original = z.read(name)
+            elif name.lower().endswith(".png"):
+                masks.append(z.read(name))
+            elif name.lower().endswith(".mp4"):
+                original = z.read(name)
+                video = True
+            else:
+                raise ValueError("Unsupported file in zip file")
+
+    if video:
+        handle_video_with_text(original, masks, output_path)
+    else:
+        handle_image_with_text(original, masks, output_path)
 
 def add_exif_data(image_path: Path, memory: Memory):
     try:
@@ -158,10 +204,8 @@ async def download_memory(
 
                 output_path = output_dir / f"{memory.filename}{ext}"
                 if "application/zip" in content_type:
-                    # Unzip file + combine base image + masks
-                    combined_image = handle_zip_folders(content)
-                    combined_image.save(output_path)
-                    
+                    # Unzip file + combine base image + masks, then save
+                    handle_zip_folders(content, output_path)
                 else:
                     output_path.write_bytes(content)
 
