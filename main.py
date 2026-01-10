@@ -84,7 +84,7 @@ def handle_image_with_text(original, masks, output_path: Path):
 
 def handle_video_with_text(original, masks, output_path: Path):
     original_bytes = io.BytesIO(original)
-    with tempfile.TemporaryDirectory as tmp:
+    with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         video_in = tmp/ "input.mp4"
         video_in.write_bytes(original_bytes)        
