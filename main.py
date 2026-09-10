@@ -83,12 +83,15 @@ def handle_image_with_text(original, masks, output_path: Path):
 
 
 def handle_video_with_text(original, masks, output_path: Path):
+    # Temporary: Just save all the files (video + the pngs) in a folder
+
     original_bytes = io.BytesIO(original)
     with tempfile.TemporaryDirectory() as tmp:
         tmp = Path(tmp)
         video_in = tmp/ "input.mp4"
-        video_in.write_bytes(original_bytes)        
-
+        video_in.write_bytes(original_bytes) 
+        print("Error before")       
+    
         stream = ffmpeg.input(str(video_in))
         
         for i, mask in enumerate(masks):
@@ -97,7 +100,7 @@ def handle_video_with_text(original, masks, output_path: Path):
             stream = ffmpeg.overlay(stream, ffmpeg.input(str(mask_in)))
         
         video_out = tmp/ "output.mp4"        
-
+    
         (
             stream
             .output(
@@ -110,7 +113,7 @@ def handle_video_with_text(original, masks, output_path: Path):
             .overwrite_output()
             .run(quiet=True)
         )
-
+    
         output_path.write_bytes(video_out.read_bytes())
 
 
@@ -134,6 +137,7 @@ def handle_zip_folders(content, output_path: Path):
                 masks.append(z.read(name))
             elif name.lower().endswith(".mp4"):
                 original = z.read(name)
+                print("type of file:", type(original))
                 video = True
             else:
                 raise ValueError("Unsupported file in zip file")
@@ -142,6 +146,7 @@ def handle_zip_folders(content, output_path: Path):
         handle_video_with_text(original, masks, output_path)
     else:
         handle_image_with_text(original, masks, output_path)
+
 
 def add_exif_data(image_path: Path, memory: Memory):
     try:
@@ -197,13 +202,15 @@ async def download_memory(
                 elif "video/mp4" in content_type:
                     ext = ".mp4"
                 elif "application/zip" in content_type:
-                    ext = ".jpg"
+                    #TODO: Bug: Must be differentiated later in the handling of the zip file
+                    ext = ".zip"
 
                 else:
                     raise ValueError(f"Unknown content type: {content_type}")
 
                 output_path = output_dir / f"{memory.filename}{ext}"
-                if "application/zip" in content_type:
+                if False and "application/zip" in content_type:
+                    # TODO: Remove this incorrect case handling
                     # Unzip file + combine base image + masks, then save
                     handle_zip_folders(content, output_path)
                 else:
@@ -261,6 +268,7 @@ async def download_all(
             stats.downloaded += 1
         else:
             stats.failed += 1
+            print("Failed to download", memory.filename)
         stats.mb += bytes_downloaded / 1024 / 1024
 
         elapsed = time.time() - start_time
